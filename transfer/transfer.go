@@ -61,6 +61,10 @@ func (t *Trans) Run(ctx context.Context) error {
 		if !ok {
 			panic("storage.tsdb.retention not found")
 		}
+		log.Println(v)
+		if v == "0s" {
+			v = "15d"
+		}
 		if v[len(v)-1] == 'd' {
 			a, err := strconv.Atoi(v[0 : len(v)-1])
 			if err != nil {
@@ -88,12 +92,12 @@ func (t *Trans) Run(ctx context.Context) error {
 	for _, i := range names {
 		c <- struct{}{}
 		go func(i string) {
-			log.Println("start ", i)
+			//log.Println("start ", i)
 			err := t.runOne(string(i))
 			if err != nil {
 				log.Fatal(err)
 			}
-			log.Println("done ", i)
+			//log.Println("done ", i)
 			wg.Done()
 			<-c
 		}(string(i))
@@ -105,8 +109,9 @@ func (t *Trans) Run(ctx context.Context) error {
 func (t *Trans) runOne(name string) error {
 	start := t.Start
 	finish := t.End
+	log.Println(start, finish)
 	for start.Before(finish) {
-		end := start.Add(t.Step * 60 * 1)
+		end := start.Add(t.Step * 60)
 		log.Println("one...", start.Format(time.RFC3339), end.Format(time.RFC3339))
 		ctx, _ := context.WithTimeout(context.Background(), time.Second*10)
 		v, warn, err := t.p.QueryRange(ctx, name, v1.Range{

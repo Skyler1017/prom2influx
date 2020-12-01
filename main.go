@@ -66,6 +66,7 @@ func parseFlags() *config {
 }
 
 func main() {
+	log.SetFlags(log.Lshortfile | log.LstdFlags)
 	cfg := parseFlags()
 	host, err := url.Parse(cfg.influxdbURL)
 	if err != nil {
@@ -94,7 +95,7 @@ func main() {
 	c, _ := api.NewClient(api.Config{
 		Address: cfg.prometheusURL,
 	})
-	api := v1.NewAPI(c)
-	t := transfer.NewTrans(cfg.influxdbDatabase, start, end, cfg.step, api, con, cfg.c, cfg.retry, cfg.monitorLabel)
+	newAPI := v1.NewAPI(c)
+	t := transfer.NewTrans(cfg.influxdbDatabase, start, end, cfg.step, newAPI, con, cfg.c, cfg.retry, cfg.monitorLabel)
 	log.Fatalln(t.Run(context.Background()))
 }
