@@ -1,9 +1,9 @@
-package transfer
+package main
 
 import (
 	"context"
-	"encoding/json"
-	"log"
+	"fmt"
+	"github.com/google/logger"
 	"strconv"
 	"sync"
 	"time"
@@ -14,38 +14,46 @@ import (
 	"github.com/prometheus/common/model"
 )
 
-func NewTrans(database string, start, end time.Time, step time.Duration, p v1.API, i *client.Client, c, retry int, monitorLabel string) *Trans {
-	return &Trans{
-		Database:     database,
-		Start:        start,
-		End:          end,
-		Step:         step,
-		p:            p,
-		i:            i,
-		C:            c,
-		Retry:        retry,
-		MonitorLabel: monitorLabel,
-	}
+type Trans struct {
+	Database         string
+	Start            time.Time
+	End              time.Time
+	Step             time.Duration
+	promClient       v1.API
+	influxClient     *client.Client
+	numOfConnections int
+	Retry            int
+	MonitorLabel     string
+	log              *logger.Logger
 }
 
-type Trans struct {
-	Database     string
-	Start        time.Time
-	End          time.Time
-	Step         time.Duration
-	p            v1.API
-	i            *client.Client
-	C            int
-	Retry        int
-	MonitorLabel string
+func NewTrans(database string, start, end time.Time, step time.Duration, p v1.API, i *client.Client,
+	c, retry int, monitorLabel string, log *logger.Logger) *Trans {
+	return &Trans{
+		Database:         database,
+		Start:            start,
+		End:              end,
+		Step:             step,
+		promClient:       p,
+		influxClient:     i,
+		numOfConnections: c,
+		Retry:            retry,
+		MonitorLabel:     monitorLabel,
+		log:              log,
+	}
 }
 
 func (t *Trans) Run(ctx context.Context) error {
-	names, warn, err := t.p.LabelValues(ctx, "__name__")
+	Logger := t.log
+
+	// query metric metricNames
+	metricNames, warn, err := t.promClient.LabelValues(ctx, "__name__")
 	_ = warn
 	if err != nil {
+		Logger.Info(err)
 		return err
 	}
+	// parse time
 	if t.End.IsZero() {
 		t.End = time.Now()
 	}
@@ -53,7 +61,7 @@ func (t *Trans) Run(ctx context.Context) error {
 		t.Step = time.Minute
 	}
 	if t.Start.IsZero() {
-		flags, err := t.p.Flags(ctx)
+		flags, err := t.promClient.Flags(ctx)
 		if err != nil {
 			return err
 		}
@@ -61,85 +69,99 @@ func (t *Trans) Run(ctx context.Context) error {
 		if !ok {
 			panic("storage.tsdb.retention not found")
 		}
-		log.Println(v)
 		if v == "0s" {
 			v = "15d"
 		}
 		if v[len(v)-1] == 'd' {
 			a, err := strconv.Atoi(v[0 : len(v)-1])
 			if err != nil {
+				Logger.Error(err)
 				return err
 			}
 			v = strconv.Itoa(a*24) + "h"
 		}
 		d, err := time.ParseDuration(v)
 		if err != nil {
+			Logger.Error(err)
 			return err
 		}
 		t.Start = time.Now().Add(-d)
 	}
-	if err != nil {
-		return err
+	if t.numOfConnections == 0 {
+		t.numOfConnections = 1
 	}
-	if t.C == 0 {
-		t.C = 1
-	}
-	v, _ := json.Marshal(t)
-	log.Println(string(v))
-	c := make(chan struct{}, t.C)
+
+	c := make(chan struct{}, t.numOfConnections)
 	wg := sync.WaitGroup{}
-	wg.Add(len(names))
-	for _, i := range names {
+	wg.Add(len(metricNames))
+
+	for _, metric := range metricNames {
 		c <- struct{}{}
-		go func(i string) {
-			//log.Println("start ", i)
-			err := t.runOne(string(i))
+		// sync one metric
+		go func(m string) {
+			err := t.syncMetric(m)
 			if err != nil {
-				log.Fatal(err)
+				Logger.Error(err)
 			}
-			//log.Println("done ", i)
 			wg.Done()
 			<-c
-		}(string(i))
+		}(string(metric))
 	}
 	wg.Wait()
 	return nil
 }
 
-func (t *Trans) runOne(name string) error {
+func (t *Trans) syncMetric(metric string) error {
+	Logger := t.log
 	start := t.Start
 	finish := t.End
-	log.Println(start, finish)
+	total := 0
+	failCnt := 0
+	step := t.End.Sub(t.Start)
+
 	for start.Before(finish) {
-		end := start.Add(t.Step * 60)
-		log.Println("one...", start.Format(time.RFC3339), end.Format(time.RFC3339))
+		end := start.Add(step)
 		ctx, _ := context.WithTimeout(context.Background(), time.Second*10)
-		v, warn, err := t.p.QueryRange(ctx, name, v1.Range{
+		v, warn, err := t.promClient.QueryRange(ctx, metric, v1.Range{
 			Start: start,
 			End:   end,
 			Step:  t.Step,
 		})
-		_ = warn
+		if warn != nil {
+			Logger.Info(warn)
+		}
 		if err != nil {
-			panic("")
+			failCnt += 1
+			if failCnt < 10 {
+				var after time.Duration
+				after = time.Duration(step.Nanoseconds() / 2)
+				Logger.Warningf("【%4d】【%4d】->【%4d】    【%s】\n", int(step.Hours()), int(step.Hours()), int(after.Hours()), metric)
+				step = after
+				continue
+			}
+			fmt.Errorf("%+v", err)
+			Logger.Error(metric, err)
 			return err
 		}
-		bps := t.valueToInfluxdb(name, v)
+		bps := t.valueToInfluxdb(metric, v)
+		Logger.Infof("【%4d】%4d points detected  【%s】", int(step.Hours()), len(bps), metric)
 		for _, i := range bps {
 			var err error
 			for try := 0; try <= t.Retry; try++ {
-				_, err = t.i.Write(i)
+				_, err = t.influxClient.Write(i)
 				if err == nil {
 					break
 				}
 			}
 			if err != nil {
-				panic(err)
+				Logger.Error(err)
 				return err
 			}
 		}
 		start = end
+		total += len(bps)
 	}
+	Logger.Infof("【%s】 migrated %d records\n", metric, total)
 	return nil
 }
 
@@ -203,7 +225,7 @@ func (t *Trans) valueToInfluxdb(name string, v model.Value) (bps []client.BatchP
 				Measurement: name,
 				Tags:        externalLabels,
 
-				Fields:    map[string]interface{}{"value": string(v.Value)},
+				Fields:    map[string]interface{}{"value": v.Value},
 				Precision: "ms",
 			}},
 			Database: t.Database,

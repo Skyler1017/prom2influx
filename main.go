@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/google/logger"
+	"io/ioutil"
 	"log"
 	"net/url"
 	"os"
@@ -14,15 +16,16 @@ import (
 	"github.com/prometheus/client_golang/api"
 	"github.com/prometheus/client_golang/api/prometheus/v1"
 	"gopkg.in/alecthomas/kingpin.v2"
-
-	"github.com/zhyon404/prom2influx/transfer"
 )
 
 type config struct {
+	verbose          bool
 	influxdbURL      string
 	prometheusURL    string
 	monitorLabel     string
 	influxdbDatabase string
+	username         string
+	password         string
 	start            string
 	end              string
 	step             time.Duration
@@ -30,14 +33,22 @@ type config struct {
 	retry            int
 }
 
-func parseFlags() *config {
+var Logger = logger.Init("migrateLog", true, false, ioutil.Discard)
+
+func parseConfig() *config {
 	a := kingpin.New(filepath.Base(os.Args[0]), "Remote storage adapter")
 	a.HelpFlag.Short('h')
 
 	cfg := &config{}
 
+	a.Flag("verbose", "print info level logs to stdout").
+		Default("true").BoolVar(&cfg.verbose)
 	a.Flag("influxdb-url", "The URL of the remote InfluxDB server to send samples to. None, if empty.").
 		Default("").StringVar(&cfg.influxdbURL)
+	a.Flag("username", "the username for influxDB.").
+		Default("").StringVar(&cfg.username)
+	a.Flag("password", "the password for influxDB.").
+		Default("").StringVar(&cfg.password)
 	a.Flag("prometheus-url", "The URL of the remote prometheus server to read samples to. None, if empty.").
 		Default("").StringVar(&cfg.prometheusURL)
 	a.Flag("monitor-label", "Prometheus Attach these labels to any time series or alerts when communicating with external systems. codelab-monitor, if empty.").
@@ -53,7 +64,7 @@ func parseFlags() *config {
 	a.Flag("c", "The connections").
 		Default("1").IntVar(&cfg.c)
 	a.Flag("retry", "The retry").
-		Default("3").IntVar(&cfg.retry)
+		Default("5").IntVar(&cfg.retry)
 
 	_, err := a.Parse(os.Args[1:])
 	if err != nil {
@@ -61,41 +72,53 @@ func parseFlags() *config {
 		a.Usage(os.Args[1:])
 		os.Exit(2)
 	}
-
 	return cfg
 }
 
 func main() {
-	log.SetFlags(log.Lshortfile | log.LstdFlags)
-	cfg := parseFlags()
+	// parse config
+	cfg := parseConfig()
 	host, err := url.Parse(cfg.influxdbURL)
 	if err != nil {
 		log.Fatal(err)
 	}
+	// set log format
+	logger.SetFlags(log.Ltime | log.Llongfile)
+	if cfg.verbose {
+		Logger.SetLevel(logger.Level(1))
+	} else {
+		Logger.SetLevel(logger.Level(3))
+	}
+
+	// parse time
 	start, err := time.Parse(time.RFC3339, cfg.start)
 	if err != nil {
-		log.Println(err)
+		Logger.Info(err)
 	}
 	end, err := time.Parse(time.RFC3339, cfg.end)
 	if err != nil {
-		log.Println(err)
+		Logger.Info(err)
 	}
-	// NOTE: this assumes you've setup a user and have setup shell env variables,
-	// namely INFLUX_USER/INFLUX_PWD. If not just omit Username/Password below.
-	conf := client.Config{
+
+	// get the influxDB client
+	cli, err := client.NewClient(client.Config{
 		URL:      *host,
-		Username: os.Getenv("INFLUX_USER"),
-		Password: os.Getenv("INFLUX_PWD"),
-	}
-	con, err := client.NewClient(conf)
+		Username: cfg.username,
+		Password: cfg.password,
+	})
 	if err != nil {
 		log.Fatal(err)
+		return
 	}
-	log.Println("Connection", con)
+
+	// get the prometheus client
 	c, _ := api.NewClient(api.Config{
 		Address: cfg.prometheusURL,
 	})
 	newAPI := v1.NewAPI(c)
-	t := transfer.NewTrans(cfg.influxdbDatabase, start, end, cfg.step, newAPI, con, cfg.c, cfg.retry, cfg.monitorLabel)
-	log.Fatalln(t.Run(context.Background()))
+
+	// transfer historical data
+	t := NewTrans(cfg.influxdbDatabase, start, end, cfg.step, newAPI,
+		cli, cfg.c, cfg.retry, cfg.monitorLabel, Logger)
+	Logger.Fatalln(t.Run(context.Background()))
 }
