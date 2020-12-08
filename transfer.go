@@ -90,7 +90,7 @@ func (t *Trans) Run(ctx context.Context) error {
 		t.numOfConnections = 1
 	}
 
-	c := make(chan struct{}, t.numOfConnections)
+	c := make(chan struct{}, t.numOfConnections) //限制并发数量
 	wg := sync.WaitGroup{}
 	wg.Add(len(metricNames))
 
@@ -98,12 +98,12 @@ func (t *Trans) Run(ctx context.Context) error {
 		c <- struct{}{}
 		// sync one metric
 		go func(m string) {
+			<-c
 			err := t.syncMetric(m)
 			if err != nil {
 				t.log.Error(m, err)
 			}
 			wg.Done()
-			<-c
 		}(string(metric))
 	}
 	wg.Wait()
@@ -129,6 +129,7 @@ func (t *Trans) sendBatchPoints(bps []client.BatchPoints) error {
 	return nil
 }
 
+// sync one metric
 func (t *Trans) syncMetric(metric string) error {
 	Logger := t.log
 	start := t.Start
