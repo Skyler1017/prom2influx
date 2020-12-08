@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"github.com/google/logger"
 	"strconv"
 	"sync"
@@ -101,13 +100,32 @@ func (t *Trans) Run(ctx context.Context) error {
 		go func(m string) {
 			err := t.syncMetric(m)
 			if err != nil {
-				Logger.Error(err)
+				t.log.Error(m, err)
 			}
 			wg.Done()
 			<-c
 		}(string(metric))
 	}
 	wg.Wait()
+	return nil
+}
+
+// 自动重试的 write 接口
+func (t *Trans) sendBatchPoints(bps []client.BatchPoints) error {
+	for _, bp := range bps {
+		var err error
+		for try := 0; try <= t.Retry; try++ {
+			_, err = t.influxClient.Write(bp)
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			t.log.Error(err)
+			return err
+		}
+	}
+	t.log.Info("   ", len(bps), " batches migrated")
 	return nil
 }
 
@@ -118,6 +136,7 @@ func (t *Trans) syncMetric(metric string) error {
 	total := 0
 	failCnt := 0
 	step := t.End.Sub(t.Start)
+	var bps []client.BatchPoints
 
 	for start.Before(finish) {
 		end := start.Add(step)
@@ -132,34 +151,39 @@ func (t *Trans) syncMetric(metric string) error {
 		}
 		if err != nil {
 			failCnt += 1
-			if failCnt < 10 {
+			if failCnt < 15 {
 				var after time.Duration
 				after = time.Duration(step.Nanoseconds() / 2)
-				Logger.Warningf("【%4d】【%4d】->【%4d】    【%s】\n", int(step.Hours()), int(step.Hours()), int(after.Hours()), metric)
+				//Logger.Warningf("【%4d】【%4d】->【%4d】    【%s】\n", int(step.Hours()), int(step.Hours()), int(after.Hours()), metric)
 				step = after
 				continue
 			}
-			fmt.Errorf("%+v", err)
 			Logger.Error(metric, err)
 			return err
 		}
-		bps := t.valueToInfluxdb(metric, v)
+		bps = append(bps, t.valueToInfluxdb(metric, v)...)
 		Logger.Infof("【%4d】%4d points detected  【%s】", int(step.Hours()), len(bps), metric)
-		for _, i := range bps {
-			var err error
-			for try := 0; try <= t.Retry; try++ {
-				_, err = t.influxClient.Write(i)
-				if err == nil {
-					break
-				}
-			}
+
+		if len(bps) > 6000 {
+			err = t.sendBatchPoints(bps)
 			if err != nil {
-				Logger.Error(err)
+				Logger.Error(metric, err)
 				return err
 			}
+			bps = nil
 		}
+
 		start = end
 		total += len(bps)
+	}
+
+	if len(bps) > 0 {
+		err := t.sendBatchPoints(bps)
+		if err != nil {
+			Logger.Error(metric, err)
+			return err
+		}
+		bps = nil
 	}
 	Logger.Infof("【%s】 migrated %d records\n", metric, total)
 	return nil

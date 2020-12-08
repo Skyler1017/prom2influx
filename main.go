@@ -120,5 +120,5 @@ func main() {
 	// transfer historical data
 	t := NewTrans(cfg.influxdbDatabase, start, end, cfg.step, newAPI,
 		cli, cfg.c, cfg.retry, cfg.monitorLabel, Logger)
-	Logger.Fatalln(t.Run(context.Background()))
+	Logger.Info(t.Run(context.Background()))
 }
