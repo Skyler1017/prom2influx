@@ -98,12 +98,12 @@ func (t *Trans) Run(ctx context.Context) error {
 		c <- struct{}{}
 		// sync one metric
 		go func(m string) {
-			<-c
 			err := t.syncMetric(m)
 			if err != nil {
 				t.log.Error(m, err)
 			}
 			wg.Done()
+			<-c
 		}(string(metric))
 	}
 	wg.Wait()
